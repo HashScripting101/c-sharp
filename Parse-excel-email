@@ -1,0 +1,61 @@
+This is where extract-msg from earlier comes in. The flow becomes: email file → pull out the attachment bytes → feed those bytes straight to pandas, no saving to disk required.
+
+Step 1: Get the email as a file
+
+From Outlook, drag the email out of your inbox into your project folder — it lands as a .msg file. That's it, that's the export.
+
+Step 2: Install the parser (same venv, terminal):
+
+python -m pip install extract-msg
+
+Step 3: The script — save as parse_email.py:
+
+python
+import io
+import extract_msg
+import pandas as pd
+from pathlib import Path
+
+msg_file = Path(__file__).parent / "test_email.msg"
+msg = extract_msg.Message(str(msg_file))
+
+print(f"From:    {msg.sender}")
+print(f"Subject: {msg.subject}")
+print(f"Date:    {msg.date}")
+print(f"Attachments found: {len(msg.attachments)}")
+
+for att in msg.attachments:
+    name = att.longFilename or att.shortFilename
+    print(f"\n--- Attachment: {name} ---")
+
+    if name and name.lower().endswith((".xlsx", ".xls")):
+        # att.data is the raw bytes -- wrap in BytesIO so pandas
+        # can read it like a file, no need to save to disk
+        sheets = pd.read_excel(io.BytesIO(att.data), sheet_name=None)
+
+        for sheet_name, df in sheets.items():
+            print(f"\n=== Sheet: {sheet_name} — {df.shape[0]} rows x {df.shape[1]} cols ===")
+            print(df.head(10))
+            print("\nColumn types:")
+            print(df.dtypes)
+    else:
+        print("(not an Excel file, skipping)")
+
+Step 4: Email yourself the same test.xlsx, drag the email into the folder as test_email.msg, then:
+
+python parse_email.py
+
+The key move is io.BytesIO(att.data) — the attachment never touches disk, so no OneDrive locks, no Excel-has-it-open problems, no cleanup. The bytes go from inside the .msg directly into a DataFrame. From sheets onward, it's byte-for-byte the same as your working parse_test.py.
+
+Two things you'll hit in the real world:
+
+Inline tables vs. attachments — if someone pastes a table into the email body instead of attaching a file, that's the pd.read_html(msg.htmlBody) path from earlier. A production version of this script does both: check attachments, then scan the body for tables.
+A folder of emails — the whole point eventually. Swap the single file for a loop:
+python
+for msg_file in Path(__file__).parent.glob("*.msg"):
+    msg = extract_msg.Message(str(msg_file))
+    ...
+
+Drag twenty emails into the folder, run once, parse everything. That's the shape of a real ingestion job — and if you later get Graph API access to a mailbox, only Step 1 changes; everything from att.data down stays identical.
+
+Try it with your test email and paste what comes out — the sender/subject lines printing correctly will confirm extract-msg handles your company's Outlook format before we trust it with anything bigger.
