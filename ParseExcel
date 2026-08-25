@@ -1,0 +1,46 @@
+Setup (one-time)
+
+Install VS Code extensions — Python (Microsoft) and Jupyter (Microsoft) from the Extensions panel (Ctrl+Shift+X)
+Open the terminal in VS Code (Ctrl+`) — PowerShell is fine
+Create the virtual environment — python wasn't on PATH, so the py launcher was the fix:
+py -m venv rag-env
+Activate it:
+rag-env\Scripts\activate
+
+Confirmed by the (rag-env) prefix appearing on the prompt. (One-time creation — on future sessions you only run this activate line.)
+
+Install the packages — once activated, plain python works because the venv put its own python.exe first on PATH:
+python -m pip install pandas openpyxl
+Verify:
+python -c "import pandas; print(pandas.__version__)"
+
+→ printed 3.0.5 ✓
+
+The test itself
+
+Save the Excel file into the project folder as test.xlsx
+Create parse_test.py in the same folder:
+python
+import pandas as pd
+from pathlib import Path
+
+file = Path(__file__).parent / "test.xlsx"
+sheets = pd.read_excel(file, sheet_name=None)
+
+for name, df in sheets.items():
+    print(f"\n=== Sheet: {name} — {df.shape[0]} rows x {df.shape[1]} cols ===")
+    print(df.head(10))
+    print("\nColumn types:")
+    print(df.dtypes)
+Run it:
+python parse_test.py
+Hit PermissionError → resolved it (file locked by Excel being open / OneDrive sync — closing Excel or copying the file cleared the lock), reran, and got the sheet output.
+
+Gotchas encountered along the way, for the record:
+
+python not recognized → use py, or reinstall Python with "Add to PATH" checked
+Don't re-run py -m venv rag-env while the venv is active — it can't overwrite its own running python.exe (and you never need to recreate it anyway)
+OneDrive folders cause file-lock headaches with this workflow — a plain local folder like C:\dev\ avoids it
+pandas 3.0 shows text columns as str dtype where older tutorials say object — same thing, new name
+
+Where this leaves you: proven pipeline of Excel → pandas DataFrame. The next building blocks from the roadmap are pointing this same pattern at real exported troubleshooting docs, then sentence-transformers + chromadb for the retrieval test — same venv, just two more pip installs when you're ready.
