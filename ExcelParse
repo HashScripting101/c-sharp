@@ -1,0 +1,129 @@
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Http;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using ClosedXML.Excel;
+
+namespace ExcelParse
+{
+    internal class Program
+    {
+        // Matches phrases like "Check Google is UP" or "Check Linked in is up"
+        // and pulls out the site name in the middle.
+        private static readonly Regex CheckPattern =
+            new(@"Check\s+(.+?)\s+is\s+up", RegexOptions.IgnoreCase);
+
+        // Add your internal/company URLs here. The key must match the text
+        // between "Check" and "is up" in column A exactly (not case-sensitive).
+        private static readonly Dictionary<string, string> UrlOverrides =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                { "MyCompany Portal", "https://portal.mycompany.internal" },
+                // { "Another Internal Site", "https://intranet.mycompany.com:8080" },
+            };
+
+        private static readonly HttpClient Http = new(new HttpClientHandler
+        {
+            AllowAutoRedirect = true
+        })
+        {
+            Timeout = TimeSpan.FromSeconds(10)
+        };
+
+        static async Task Main(string[] args)
+        {
+            // Point this at your workbook, or pass the path as a command-line arg.
+            string filePath = args.Length > 0
+                ? args[0]
+                : @"C:\Users\Gagan\OneDrive\Documents\Scripting\excel-parse-test.xlsx";
+
+            // Some sites (LinkedIn included) reject requests with no User-Agent.
+            Http.DefaultRequestHeaders.UserAgent.ParseAdd(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36");
+
+            using var workbook = new XLWorkbook(filePath);
+            var worksheet = workbook.Worksheet(1); // first sheet
+
+            var firstRow = worksheet.FirstRowUsed();
+            var lastRow = worksheet.LastRowUsed();
+
+            if (firstRow == null || lastRow == null)
+            {
+                Console.WriteLine("No data found in worksheet.");
+                return;
+            }
+
+            for (int row = firstRow.RowNumber(); row <= lastRow.RowNumber(); row++)
+            {
+                var labelCell = worksheet.Cell(row, 1); // column A
+                string label = labelCell.GetString().Trim();
+
+                if (string.IsNullOrWhiteSpace(label))
+                    continue;
+
+                string? url = BuildUrlFromLabel(label);
+                var resultCell = worksheet.Cell(row, 2); // column B, next to A
+
+                if (url == null)
+                {
+                    resultCell.Value = "Unrecognized check";
+                    Console.WriteLine($"Row {row}: could not parse a target from \"{label}\"");
+                    continue;
+                }
+
+                var (isReachable, status) = await CheckUrlAsync(url);
+                resultCell.Value = isReachable ? "Reachable" : $"Not Reachable ({status})";
+
+                Console.WriteLine($"Row {row}: {label} -> {url} -> {resultCell.Value}");
+            }
+
+            workbook.Save();
+            Console.WriteLine("Done. Results written and file saved.");
+        }
+
+        // Extracts a site name from "Check X is up" and turns it into a URL to test.
+        // Checks the UrlOverrides dictionary first (use this for internal/company
+        // URLs), then falls back to guessing a public ".com" domain from the name,
+        // e.g. "Google" -> https://www.google.com, "Linked in" -> https://www.linkedin.com
+        private static string? BuildUrlFromLabel(string label)
+        {
+            var match = CheckPattern.Match(label);
+            if (!match.Success)
+                return null;
+
+            string rawName = match.Groups[1].Value.Trim();
+
+            // Explicit override takes priority — use this for internal URLs.
+            if (UrlOverrides.TryGetValue(rawName, out var overrideUrl))
+                return overrideUrl;
+
+            // Fallback: guess a public ".com" domain from the name.
+            string name = rawName.Replace(" ", "").ToLowerInvariant();
+            if (string.IsNullOrWhiteSpace(name))
+                return null;
+
+            return $"https://www.{name}.com";
+        }
+
+        private static async Task<(bool Reachable, string Status)> CheckUrlAsync(string url)
+        {
+            try
+            {
+                using var response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                bool ok = response.StatusCode == HttpStatusCode.OK;
+                return (ok, ((int)response.StatusCode).ToString());
+            }
+            catch (TaskCanceledException)
+            {
+                return (false, "Timeout");
+            }
+            catch (HttpRequestException ex)
+            {
+                return (false, ex.Message);
+            }
+        }
+    }
+}
