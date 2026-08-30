@@ -1,0 +1,115 @@
+using System;
+using System.Text.RegularExpressions;
+using HtmlAgilityPack;
+using Outlook = Microsoft.Office.Interop.Outlook;
+
+namespace OutlookTableChecker
+{
+    // Reads the email currently open (in its own window) or selected in
+    // Outlook desktop, finds a 2x2 HTML table in the body, and checks each
+    // cell for "good" / "not good".
+    //
+    // Works via COM automation against Outlook already running on your
+    // machine - no Azure AD / cloud app registration needed. Requires
+    // classic Outlook desktop (not the new "Outlook for Windows" app,
+    // which doesn't expose this).
+    //
+    // NuGet packages needed:
+    //   Microsoft.Office.Interop.Outlook
+    //   HtmlAgilityPack
+    internal class Program
+    {
+        // Matches "not good" (checked first) vs a standalone "good", so
+        // "not good" doesn't get misread as a match for "good".
+        private static readonly Regex NotGoodPattern =
+            new(@"\bnot\s+good\b", RegexOptions.IgnoreCase);
+        private static readonly Regex GoodPattern =
+            new(@"\bgood\b", RegexOptions.IgnoreCase);
+
+        static void Main()
+        {
+            var outlookApp = new Outlook.Application();
+
+            Outlook.MailItem mail = GetCurrentEmail(outlookApp);
+            if (mail == null)
+            {
+                Console.WriteLine("No email is open or selected in Outlook.");
+                return;
+            }
+
+            Console.WriteLine($"Checking email: \"{mail.Subject}\"");
+
+            string htmlBody = mail.HTMLBody;
+            if (string.IsNullOrWhiteSpace(htmlBody))
+            {
+                Console.WriteLine("This email doesn't have an HTML body - can't parse a table out of it.");
+                return;
+            }
+
+            CheckTable(htmlBody);
+        }
+
+        private static Outlook.MailItem GetCurrentEmail(Outlook.Application outlookApp)
+        {
+            // If an email is open in its own window, use that.
+            var inspector = outlookApp.ActiveInspector();
+            if (inspector?.CurrentItem is Outlook.MailItem inspectorItem)
+                return inspectorItem;
+
+            // Otherwise fall back to whatever's selected in the main window.
+            var explorer = outlookApp.ActiveExplorer();
+            if (explorer != null && explorer.Selection.Count > 0
+                && explorer.Selection[1] is Outlook.MailItem selectedItem)
+                return selectedItem;
+
+            return null;
+        }
+
+        private static string ClassifyCell(string text)
+        {
+            text = text.Trim();
+            if (NotGoodPattern.IsMatch(text))
+                return "Not Good";
+            if (GoodPattern.IsMatch(text))
+                return "Good";
+            return string.IsNullOrEmpty(text) ? "Empty" : $"Unrecognized (\"{text}\")";
+        }
+
+        private static void CheckTable(string htmlBody)
+        {
+            var doc = new HtmlDocument();
+            doc.LoadHtml(htmlBody);
+
+            var tables = doc.DocumentNode.SelectNodes("//table");
+            if (tables == null || tables.Count == 0)
+            {
+                Console.WriteLine("No table found in the email body.");
+                return;
+            }
+
+            // If the email has more than one table, this grabs the first
+            // one - adjust the index below if that's not the one you want.
+            var table = tables[0];
+            var rows = table.SelectNodes(".//tr");
+            if (rows == null)
+            {
+                Console.WriteLine("Table has no rows.");
+                return;
+            }
+
+            Console.WriteLine($"Found a table with {rows.Count} row(s).");
+            for (int r = 0; r < rows.Count; r++)
+            {
+                var cells = rows[r].SelectNodes("./td|./th");
+                if (cells == null) continue;
+
+                for (int c = 0; c < cells.Count; c++)
+                {
+                    string text = HtmlEntity.DeEntitize(cells[c].InnerText)?.Trim() ?? "";
+                    string result = ClassifyCell(text);
+                    Console.WriteLine($"  Row {r + 1}, Col {c + 1}: \"{text}\" -> {result}");
+                }
+            }
+        }
+    }
+}
