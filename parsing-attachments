@@ -1,0 +1,277 @@
+First in powershell
+dotnet build -c Release
+.\bin\Release\net8.0-windows\OutlookKeywordScan.exe --keywords "audit trail,epic,metadata" --days 60 --subfolders --csv hits.csv
+=====================================================================================================
+
+
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using DocumentFormat.OpenXml.Packaging;
+using Outlook = Microsoft.Office.Interop.Outlook;
+using Word = Microsoft.Office.Interop.Word;
+
+// Usage:
+//   OutlookKeywordScan --keywords "audit trail,epic,metadata" [--days 30] [--folder Inbox] [--subfolders] [--csv results.csv]
+//
+// Searches subject + body of each mail item, then any .docx/.doc attachments.
+// Matching is case-insensitive and whole-word.
+
+var opts = Options.Parse(args);
+if (opts.Keywords.Count == 0)
+{
+    Console.Error.WriteLine("No keywords given. Example: --keywords \"invoice,contract,deposition\"");
+    return 1;
+}
+
+var regex = new Regex(
+    @"\b(" + string.Join("|", opts.Keywords.Select(Regex.Escape)) + @")\b",
+    RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+var results = new List<Hit>();
+var tempDir = Path.Combine(Path.GetTempPath(), "OutlookKeywordScan");
+Directory.CreateDirectory(tempDir);
+
+Outlook.Application? app = null;
+Outlook.NameSpace? ns = null;
+try
+{
+    app = new Outlook.Application();
+    ns = app.GetNamespace("MAPI");
+    Outlook.MAPIFolder root = opts.FolderName.Equals("Inbox", StringComparison.OrdinalIgnoreCase)
+        ? ns.GetDefaultFolder(Outlook.OlDefaultFolders.olFolderInbox)
+        : FindFolder(ns, opts.FolderName)
+          ?? throw new Exception($"Folder '{opts.FolderName}' not found.");
+
+    Console.WriteLine($"Scanning '{root.FolderPath}' for: {string.Join(", ", opts.Keywords)}");
+    ScanFolder(root, opts.Recurse);
+}
+catch (COMException ex)
+{
+    Console.Error.WriteLine($"Outlook COM error: {ex.Message}. Is desktop Outlook installed and not blocked by a security prompt?");
+    return 2;
+}
+finally
+{
+    if (ns != null) Marshal.ReleaseComObject(ns);
+    if (app != null) Marshal.ReleaseComObject(app);
+}
+
+// ---------- Output ----------
+Console.WriteLine();
+Console.WriteLine($"{results.Count} hit(s).");
+foreach (var h in results)
+{
+    Console.WriteLine($"[{h.Received:yyyy-MM-dd HH:mm}] {h.Sender} | {h.Subject}");
+    Console.WriteLine($"    Where: {h.Location}   Keywords: {string.Join(", ", h.Matched)}");
+    Console.WriteLine($"    ...{h.Snippet}...");
+}
+
+if (opts.CsvPath != null)
+{
+    var sb = new StringBuilder("Received,Sender,Subject,Location,Keywords,Snippet\n");
+    foreach (var h in results)
+        sb.AppendLine(string.Join(",", new[] { h.Received.ToString("s"), h.Sender, h.Subject, h.Location,
+                                                string.Join(";", h.Matched), h.Snippet }.Select(Csv)));
+    File.WriteAllText(opts.CsvPath, sb.ToString(), Encoding.UTF8);
+    Console.WriteLine($"Wrote {opts.CsvPath}");
+}
+return 0;
+
+// ---------- Scanning ----------
+void ScanFolder(Outlook.MAPIFolder folder, bool recurse)
+{
+    var items = folder.Items;
+    items.Sort("[ReceivedTime]", true);
+    if (opts.Days > 0)
+    {
+        var since = DateTime.Now.AddDays(-opts.Days).ToString("g");
+        items = items.Restrict($"[ReceivedTime] >= '{since}'");
+    }
+
+    foreach (object obj in items)
+    {
+        if (obj is not Outlook.MailItem mail) { Marshal.ReleaseComObject(obj); continue; }
+        try { ScanMail(mail); }
+        catch (Exception ex) { Console.Error.WriteLine($"  ! Skipped '{mail.Subject}': {ex.Message}"); }
+        finally { Marshal.ReleaseComObject(mail); }
+    }
+
+    if (!recurse) return;
+    foreach (Outlook.MAPIFolder sub in folder.Folders)
+    {
+        ScanFolder(sub, true);
+        Marshal.ReleaseComObject(sub);
+    }
+}
+
+void ScanMail(Outlook.MailItem mail)
+{
+    string subject = mail.Subject ?? "";
+    string sender = mail.SenderEmailAddress ?? mail.SenderName ?? "";
+    DateTime received = mail.ReceivedTime;
+
+    CheckText(subject + "\n" + (mail.Body ?? ""), "Email body", subject, sender, received);
+
+    foreach (Outlook.Attachment att in mail.Attachments)
+    {
+        try
+        {
+            var ext = Path.GetExtension(att.FileName ?? "").ToLowerInvariant();
+            if (ext is not (".docx" or ".docm" or ".doc")) continue;
+
+            var path = Path.Combine(tempDir, Guid.NewGuid() + ext);
+            att.SaveAsFile(path);
+            try
+            {
+                string text = ext == ".doc" ? ReadLegacyDoc(path) : ReadDocx(path);
+                CheckText(text, $"Attachment: {att.FileName}", subject, sender, received);
+            }
+            finally { File.Delete(path); }
+        }
+        finally { Marshal.ReleaseComObject(att); }
+    }
+}
+
+void CheckText(string text, string location, string subject, string sender, DateTime received)
+{
+    var matches = regex.Matches(text);
+    if (matches.Count == 0) return;
+
+    var first = matches[0];
+    int start = Math.Max(0, first.Index - 60);
+    int len = Math.Min(text.Length - start, first.Length + 120);
+    string snippet = Regex.Replace(text.Substring(start, len), @"\s+", " ").Trim();
+
+    results.Add(new Hit(received, sender, subject, location,
+        matches.Select(m => m.Value.ToLowerInvariant()).Distinct().ToList(), snippet));
+}
+
+// ---------- Word readers ----------
+static string ReadDocx(string path)
+{
+    using var doc = WordprocessingDocument.Open(path, false);
+    var sb = new StringBuilder();
+    if (doc.MainDocumentPart?.Document?.Body is { } body) sb.AppendLine(body.InnerText);
+    foreach (var hp in doc.MainDocumentPart?.HeaderParts ?? []) sb.AppendLine(hp.Header?.InnerText);
+    foreach (var fp in doc.MainDocumentPart?.FooterParts ?? []) sb.AppendLine(fp.Footer?.InnerText);
+    return sb.ToString();
+}
+
+static string ReadLegacyDoc(string path)
+{
+    // Legacy binary .doc has no OpenXML; fall back to Word automation.
+    Word.Application? word = null;
+    Word.Document? doc = null;
+    try
+    {
+        word = new Word.Application { Visible = false };
+        doc = word.Documents.Open(path, ReadOnly: true, Visible: false);
+        return doc.Content.Text;
+    }
+    finally
+    {
+        doc?.Close(false);
+        word?.Quit(false);
+        if (doc != null) Marshal.ReleaseComObject(doc);
+        if (word != null) Marshal.ReleaseComObject(word);
+    }
+}
+
+static Outlook.MAPIFolder? FindFolder(Outlook.NameSpace ns, string name)
+{
+    foreach (Outlook.MAPIFolder store in ns.Folders)
+    {
+        var f = FindIn(store, name);
+        if (f != null) return f;
+    }
+    return null;
+
+    static Outlook.MAPIFolder? FindIn(Outlook.MAPIFolder parent, string name)
+    {
+        foreach (Outlook.MAPIFolder f in parent.Folders)
+        {
+            if (f.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) return f;
+            var deeper = FindIn(f, name);
+            if (deeper != null) return deeper;
+        }
+        return null;
+    }
+}
+
+static string Csv(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
+
+record Hit(DateTime Received, string Sender, string Subject, string Location, List<string> Matched, string Snippet);
+
+class Options
+{
+    public List<string> Keywords { get; } = new();
+    public string FolderName { get; set; } = "Inbox";
+    public int Days { get; set; } = 30;
+    public bool Recurse { get; set; }
+    public string? CsvPath { get; set; }
+
+    public static Options Parse(string[] args)
+    {
+        var o = new Options();
+        for (int i = 0; i < args.Length; i++)
+        {
+            string next() => i + 1 < args.Length ? args[++i] : "";
+            switch (args[i].ToLowerInvariant())
+            {
+                case "--keywords": o.Keywords.AddRange(next().Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)); break;
+                case "--folder": o.FolderName = next(); break;
+                case "--days": o.Days = int.Parse(next()); break;
+                case "--subfolders": o.Recurse = true; break;
+                case "--csv": o.CsvPath = next(); break;
+            }
+        }
+        return o;
+    }
+}
+
+==========================================
+
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Reads .docx without needing Word -->
+    <PackageReference Include="DocumentFormat.OpenXml" Version="3.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Outlook COM (desktop Outlook must be installed) -->
+    <COMReference Include="Microsoft.Office.Interop.Outlook">
+      <Guid>{00062FFF-0000-0000-C000-000000000046}</Guid>
+      <VersionMajor>9</VersionMajor>
+      <VersionMinor>6</VersionMinor>
+      <Lcid>0</Lcid>
+      <WrapperTool>tlbimp</WrapperTool>
+      <EmbedInteropTypes>true</EmbedInteropTypes>
+    </COMReference>
+    <!-- Word COM, only used as a fallback for legacy .doc attachments -->
+    <COMReference Include="Microsoft.Office.Interop.Word">
+      <Guid>{00020905-0000-0000-C000-000000000046}</Guid>
+      <VersionMajor>8</VersionMajor>
+      <VersionMinor>7</VersionMinor>
+      <Lcid>0</Lcid>
+      <WrapperTool>tlbimp</WrapperTool>
+      <EmbedInteropTypes>true</EmbedInteropTypes>
+    </COMReference>
+  </ItemGroup>
+
+</Project>
+
+outlookkeyprog. 
+
+Two caveats: Outlook may pop a "program is trying to access email" security prompt the first time — that's the Programmatic Access setting in Trust Center if you want to suppress it. And if you want substring matching instead of whole-word (e.g. "deposit" matching "deposition"), remove the \b anchors in the regex.
+
+=============
