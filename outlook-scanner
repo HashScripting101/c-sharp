@@ -1,0 +1,302 @@
+// =============================================================================
+// OutlookScanner.cs
+// -----------------------------------------------------------------------------
+// Connects to the local Outlook desktop application via LATE-BOUND COM
+// automation and walks mail folders looking for supported attachments.
+//
+// DEPENDENCIES:
+//   - None (no NuGet package). Uses System.Runtime.InteropServices +
+//     C# 'dynamic', which requires Microsoft.CSharp - built into .NET 5+.
+//   - Windows only.
+//
+// WHY LATE BINDING INSTEAD OF Microsoft.Office.Interop.Outlook?
+//   The typed interop assembly is pinned to a specific Outlook version and is
+//   painful on .NET 8. Late binding (Type.GetTypeFromProgID + dynamic) talks to
+//   whatever Outlook version is installed with no reference at all.
+//
+// OUTLOOK CONSTANTS USED (from the Outlook object model):
+//   olFolderInbox = 6
+//   olMail        = "IPM.Note" message class
+// =============================================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+
+namespace OutlookFileSearch
+{
+    /// <summary>
+    /// Scans Outlook folders for attachments of supported file types and
+    /// extracts them to a temp directory so their contents can be read.
+    /// </summary>
+    public sealed class OutlookScanner : IDisposable
+    {
+        private const int OlFolderInbox = 6;
+
+        private dynamic? _outlookApp;
+        private dynamic? _namespace;
+        private readonly string _tempDir;
+        private bool _disposed;
+
+        public OutlookScanner()
+        {
+            // All attachments get extracted into one temp folder we own,
+            // so cleanup is a single directory delete on Dispose().
+            _tempDir = Path.Combine(Path.GetTempPath(),
+                                    "OutlookFileSearch_" + Guid.NewGuid().ToString("N")[..8]);
+            Directory.CreateDirectory(_tempDir);
+        }
+
+        /// <summary>
+        /// Attaches to a running Outlook instance, or starts one if needed.
+        /// Returns false (with a console message) if Outlook is unavailable.
+        /// </summary>
+        public bool Connect()
+        {
+            Console.WriteLine("\nConnecting to Outlook...");
+
+            try
+            {
+                // Try to attach to an already-running Outlook first.
+                // NOTE: Marshal.GetActiveObject was removed in .NET 5+, so we
+                // P/Invoke the underlying OLE function ourselves (see below).
+                _outlookApp = ComHelper.GetRunningInstance("Outlook.Application");
+
+                if (_outlookApp == null)
+                {
+                    // Not running - launch a new instance.
+                    var type = Type.GetTypeFromProgID("Outlook.Application");
+                    if (type == null)
+                    {
+                        Console.WriteLine("Outlook does not appear to be installed on this machine.");
+                        return false;
+                    }
+                    _outlookApp = Activator.CreateInstance(type);
+                }
+
+                // MAPI namespace = the messaging session (stores, folders, items).
+                _namespace = _outlookApp!.GetNamespace("MAPI");
+
+                Console.WriteLine("Connected to Outlook.\n");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to connect to Outlook: {ex.Message}");
+                Console.WriteLine("Checklist:");
+                Console.WriteLine("  - You are on Windows");
+                Console.WriteLine("  - Outlook desktop is installed and a profile is configured");
+                Console.WriteLine("  - This app and Outlook run at the same elevation level");
+                Console.WriteLine("    (do NOT run one as Administrator and the other as a normal user)");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Walks the Inbox (optionally its subfolders) and extracts every
+        /// supported attachment to the temp directory.
+        /// </summary>
+        /// <param name="subjectFilter">Optional subject keyword filter; null = all mail.</param>
+        /// <param name="includeSubfolders">Recurse into Inbox subfolders.</param>
+        public List<FoundFile> ScanForAttachments(string? subjectFilter, bool includeSubfolders)
+        {
+            var found = new List<FoundFile>();
+
+            if (_namespace == null)
+                return found;
+
+            Console.WriteLine("Scanning Outlook for attachments...");
+
+            try
+            {
+                dynamic inbox = _namespace.GetDefaultFolder(OlFolderInbox);
+                ScanFolder(inbox, subjectFilter, includeSubfolders, found, out var scanned);
+
+                Console.WriteLine($"Scanned {scanned} messages.");
+                Console.WriteLine($"Extracted {found.Count} supported attachments.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error while scanning: {ex.Message}");
+            }
+
+            return found;
+        }
+
+        private void ScanFolder(dynamic folder, string? subjectFilter, bool recurse,
+                                List<FoundFile> found, out int scannedCount)
+        {
+            scannedCount = 0;
+
+            try
+            {
+                dynamic items = folder.Items;
+
+                // Server-side filter is far faster than checking every item in C#.
+                // DASL/Jet syntax: [Subject] like '%keyword%'
+                if (!string.IsNullOrWhiteSpace(subjectFilter))
+                {
+                    var escaped = subjectFilter.Replace("'", "''");
+                    items = items.Restrict($"[Subject] like '%{escaped}%'");
+                }
+
+                int count = items.Count;
+
+                // Outlook collections are 1-based, not 0-based.
+                for (int i = 1; i <= count; i++)
+                {
+                    dynamic? item = null;
+                    try
+                    {
+                        item = items[i];
+
+                        // Skip non-mail items (appointments, contacts, etc.)
+                        // by testing for the Attachments property defensively.
+                        int attachmentCount = item.Attachments.Count;
+                        scannedCount++;
+
+                        if (attachmentCount == 0)
+                            continue;
+
+                        string subject = SafeString(() => (string)item.Subject);
+                        string sender  = SafeString(() => (string)item.SenderName);
+                        DateTime received = SafeDate(() => (DateTime)item.ReceivedTime);
+
+                        for (int a = 1; a <= attachmentCount; a++)
+                        {
+                            dynamic? attachment = null;
+                            try
+                            {
+                                attachment = item.Attachments[a];
+                                string fileName = attachment.FileName;
+                                string ext = Path.GetExtension(fileName).ToLowerInvariant();
+
+                                if (!FileReader.SupportedExtensions.Contains(ext))
+                                    continue;
+
+                                // Save to our temp dir with a unique prefix so two
+                                // attachments named "report.xlsx" don't collide.
+                                var safeName = $"{found.Count:D5}_{SanitizeFileName(fileName)}";
+                                var destPath = Path.Combine(_tempDir, safeName);
+
+                                attachment.SaveAsFile(destPath);
+
+                                found.Add(new FoundFile
+                                {
+                                    FileName  = fileName,
+                                    Extension = ext,
+                                    Subject   = subject,
+                                    Sender    = sender,
+                                    Received  = received,
+                                    LocalPath = destPath,
+                                    SizeBytes = File.Exists(destPath) ? new FileInfo(destPath).Length : 0
+                                });
+                            }
+                            catch
+                            {
+                                // Skip attachments we cannot save (inline images,
+                                // blocked types, permission errors).
+                            }
+                            finally
+                            {
+                                ReleaseCom(attachment);
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Skip items that throw (non-mail items, corrupt entries).
+                    }
+                    finally
+                    {
+                        ReleaseCom(item);
+                    }
+                }
+
+                // Recurse into subfolders if requested.
+                if (recurse)
+                {
+                    dynamic subFolders = folder.Folders;
+                    int folderCount = subFolders.Count;
+
+                    for (int f = 1; f <= folderCount; f++)
+                    {
+                        dynamic? child = null;
+                        try
+                        {
+                            child = subFolders[f];
+                            ScanFolder(child, subjectFilter, true, found, out var childScanned);
+                            scannedCount += childScanned;
+                        }
+                        catch
+                        {
+                            // Skip inaccessible folders.
+                        }
+                        finally
+                        {
+                            ReleaseCom(child);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  (skipped a folder: {ex.Message})");
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Helpers
+        // ---------------------------------------------------------------------
+
+        private static string SafeString(Func<string> getter)
+        {
+            try { return getter() ?? string.Empty; }
+            catch { return string.Empty; }
+        }
+
+        private static DateTime SafeDate(Func<DateTime> getter)
+        {
+            try { return getter(); }
+            catch { return DateTime.MinValue; }
+        }
+
+        private static string SanitizeFileName(string name)
+        {
+            foreach (var c in Path.GetInvalidFileNameChars())
+                name = name.Replace(c, '_');
+            return name;
+        }
+
+        private static void ReleaseCom(object? comObject)
+        {
+            if (comObject != null && Marshal.IsComObject(comObject))
+            {
+                try { Marshal.ReleaseComObject(comObject); } catch { /* ignore */ }
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            ReleaseCom(_namespace);
+            ReleaseCom(_outlookApp);
+            _namespace = null;
+            _outlookApp = null;
+
+            // Remove extracted attachments.
+            try
+            {
+                if (Directory.Exists(_tempDir))
+                    Directory.Delete(_tempDir, recursive: true);
+            }
+            catch { /* temp files will be cleaned by the OS eventually */ }
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+    }
+}
