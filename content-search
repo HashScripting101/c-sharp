@@ -1,0 +1,118 @@
+// =============================================================================
+// ContentSearcher.cs
+// -----------------------------------------------------------------------------
+// Data models + the actual keyword search across extracted file contents.
+//
+// DEPENDENCIES: none beyond the base class library.
+// =============================================================================
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace OutlookFileSearch
+{
+    /// <summary>One attachment (or local file) that is a supported type.</summary>
+    public sealed class FoundFile
+    {
+        public string FileName  { get; set; } = string.Empty;
+        public string Extension { get; set; } = string.Empty;
+        public string Subject   { get; set; } = string.Empty;
+        public string Sender    { get; set; } = string.Empty;
+        public DateTime Received { get; set; }
+        public long SizeBytes   { get; set; }
+
+        /// <summary>Path on disk (temp dir for attachments, original path in folder mode).</summary>
+        public string LocalPath { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Cached text content. Files are read once and reused across searches,
+        /// so a second query does not re-parse every spreadsheet.
+        /// </summary>
+        public string? CachedContent { get; set; }
+
+        public bool ContentLoaded { get; set; }
+    }
+
+    /// <summary>A file that matched, plus the lines that matched.</summary>
+    public sealed class SearchMatch
+    {
+        public FoundFile File { get; init; } = null!;
+        public List<string> MatchedLines { get; init; } = new();
+        public int TotalMatchCount { get; init; }
+    }
+
+    public static class ContentSearcher
+    {
+        private const int MaxLinesPerFile = 10;
+
+        /// <summary>
+        /// Searches every file for the query (case-insensitive substring match)
+        /// and returns the files that contain it along with matching lines.
+        /// </summary>
+        public static List<SearchMatch> Search(List<FoundFile> files, string query)
+        {
+            Console.WriteLine($"\nSearching {files.Count} files for '{query}'...");
+
+            var matches = new List<SearchMatch>();
+
+            foreach (var file in files)
+            {
+                // Lazy-load and cache: read from disk only the first time.
+                if (!file.ContentLoaded)
+                {
+                    file.CachedContent = FileReader.ReadAsText(file.LocalPath, file.Extension);
+                    file.ContentLoaded = true;
+                }
+
+                var content = file.CachedContent;
+                if (string.IsNullOrEmpty(content))
+                    continue;
+
+                if (content.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                var matchedLines = ExtractMatchingLines(content, query, out var total);
+
+                matches.Add(new SearchMatch
+                {
+                    File = file,
+                    MatchedLines = matchedLines,
+                    TotalMatchCount = total
+                });
+            }
+
+            return matches;
+        }
+
+        /// <summary>
+        /// Pulls out the individual lines containing the query.
+        /// Returns at most MaxLinesPerFile, but reports the true total.
+        /// </summary>
+        private static List<string> ExtractMatchingLines(string content, string query, out int totalCount)
+        {
+            var results = new List<string>();
+            totalCount = 0;
+
+            var lines = content.Split('\n');
+
+            foreach (var raw in lines)
+            {
+                var line = raw.Trim('\r', ' ', '\t');
+
+                if (line.Length < 2)
+                    continue;
+
+                if (line.IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                totalCount++;
+
+                if (results.Count < MaxLinesPerFile)
+                    results.Add(line);
+            }
+
+            return results;
+        }
+    }
+}
