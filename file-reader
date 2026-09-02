@@ -1,0 +1,162 @@
+// =============================================================================
+// FileReader.cs
+// -----------------------------------------------------------------------------
+// Converts each supported attachment type into plain text so it can be searched.
+//
+// -----------------------------------------------------------------------------
+// DEPENDENCIES (NuGet)
+// -----------------------------------------------------------------------------
+//   .docx  -> DocumentFormat.OpenXml
+//               dotnet add package DocumentFormat.OpenXml
+//             Reads the Open XML WordprocessingDocument body text.
+//
+//   .xlsx  -> NPOI  (XSSFWorkbook)
+//   .xls   -> NPOI  (HSSFWorkbook - legacy binary format)
+//               dotnet add package NPOI
+//             WorkbookFactory.Create() auto-detects which of the two it is.
+//
+//   .xls legacy encodings -> System.Text.Encoding.CodePages
+//               dotnet add package System.Text.Encoding.CodePages
+//             Registered once in the static constructor below; without it NPOI
+//             throws "No data is available for encoding 1252" on some files.
+//
+//   .txt / .csv -> no package. Read with File.ReadAllText.
+// =============================================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using DocumentFormat.OpenXml.Packaging;
+using NPOI.SS.UserModel;
+
+namespace OutlookFileSearch
+{
+    public static class FileReader
+    {
+        /// <summary>File types this tool knows how to read.</summary>
+        public static readonly HashSet<string> SupportedExtensions =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ".txt", ".csv", ".docx", ".xlsx", ".xls"
+            };
+
+        static FileReader()
+        {
+            // Required by NPOI for legacy .xls files that use Windows-1252 etc.
+            // Provided by the System.Text.Encoding.CodePages package.
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        }
+
+        /// <summary>
+        /// Reads a file and returns its text content, or null if it cannot be read.
+        /// </summary>
+        public static string? ReadAsText(string path, string extension)
+        {
+            try
+            {
+                return extension.ToLowerInvariant() switch
+                {
+                    ".txt"  => ReadPlainText(path),
+                    ".csv"  => ReadPlainText(path),
+                    ".docx" => ReadDocx(path),
+                    ".xlsx" => ReadExcel(path),
+                    ".xls"  => ReadExcel(path),
+                    _       => null
+                };
+            }
+            catch (Exception)
+            {
+                // A single unreadable/corrupt attachment should never stop the scan.
+                return null;
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // .txt and .csv - no library needed
+        // ---------------------------------------------------------------------
+        private static string ReadPlainText(string path)
+        {
+            // detectEncodingFromByteOrderMarks: true handles UTF-8 BOM / UTF-16 files.
+            using var reader = new StreamReader(path, Encoding.UTF8, true);
+            return reader.ReadToEnd();
+        }
+
+        // ---------------------------------------------------------------------
+        // .docx - DocumentFormat.OpenXml
+        // ---------------------------------------------------------------------
+        private static string ReadDocx(string path)
+        {
+            var sb = new StringBuilder();
+
+            using var doc = WordprocessingDocument.Open(path, false);
+            var body = doc.MainDocumentPart?.Document?.Body;
+
+            if (body == null)
+                return string.Empty;
+
+            // Paragraphs give us line-by-line text, which keeps the
+            // "matched lines" output meaningful.
+            foreach (var paragraph in body.Descendants<DocumentFormat.OpenXml.Wordprocessing.Paragraph>())
+            {
+                var text = paragraph.InnerText;
+                if (!string.IsNullOrWhiteSpace(text))
+                    sb.AppendLine(text);
+            }
+
+            // Tables inside a docx are also Paragraph descendants, so their
+            // cell text is already captured above.
+            return sb.ToString();
+        }
+
+        // ---------------------------------------------------------------------
+        // .xlsx and .xls - NPOI
+        // ---------------------------------------------------------------------
+        private static string ReadExcel(string path)
+        {
+            var sb = new StringBuilder();
+
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read);
+
+            // WorkbookFactory picks XSSFWorkbook (.xlsx) or HSSFWorkbook (.xls).
+            IWorkbook workbook = WorkbookFactory.Create(stream);
+
+            var formatter = new DataFormatter();
+
+            for (int s = 0; s < workbook.NumberOfSheets; s++)
+            {
+                var sheet = workbook.GetSheetAt(s);
+                sb.AppendLine();
+                sb.AppendLine($"--- Sheet: {sheet.SheetName} ---");
+
+                for (int r = sheet.FirstRowNum; r <= sheet.LastRowNum; r++)
+                {
+                    var row = sheet.GetRow(r);
+                    if (row == null) continue;
+
+                    var cells = new List<string>();
+                    for (int c = 0; c < row.LastCellNum; c++)
+                    {
+                        var cell = row.GetCell(c);
+                        if (cell == null)
+                        {
+                            cells.Add(string.Empty);
+                            continue;
+                        }
+
+                        // FormatCellValue renders numbers/dates the way the
+                        // sheet displays them, and evaluates cached formula results.
+                        cells.Add(formatter.FormatCellValue(cell));
+                    }
+
+                    // One spreadsheet row = one searchable line.
+                    var line = string.Join(" | ", cells).TrimEnd(' ', '|');
+                    if (!string.IsNullOrWhiteSpace(line))
+                        sb.AppendLine(line);
+                }
+            }
+
+            return sb.ToString();
+        }
+    }
+}
