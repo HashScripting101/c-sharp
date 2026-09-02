@@ -1,0 +1,256 @@
+// =============================================================================
+// Outlook File Attachment Searcher - C# Console Application
+// =============================================================================
+//
+// WHAT IT DOES:
+//   Scans Outlook mail folders for attachments (.txt, .csv, .docx, .xlsx, .xls),
+//   asks the user what text to search for, reads the contents of each attachment,
+//   and prints matching files + matching lines to the console.
+//
+// -----------------------------------------------------------------------------
+// DEPENDENCIES / NUGET PACKAGES  (all listed in OutlookFileSearch.csproj)
+// -----------------------------------------------------------------------------
+//   DocumentFormat.OpenXml            -> reads .docx (Word) files
+//       dotnet add package DocumentFormat.OpenXml
+//
+//   NPOI                              -> reads .xlsx AND legacy .xls files
+//       dotnet add package NPOI
+//
+//   System.Text.Encoding.CodePages    -> required by NPOI for legacy .xls encodings
+//       dotnet add package System.Text.Encoding.CodePages
+//
+//   Outlook itself is accessed via LATE-BOUND COM (dynamic) - no interop
+//   assembly / PIA required. That means no version mismatch between
+//   Outlook 2016 / 2019 / 365. Nothing to install for that part.
+//
+// -----------------------------------------------------------------------------
+// REQUIREMENTS
+// -----------------------------------------------------------------------------
+//   - Windows (COM automation is Windows-only)
+//   - Outlook desktop installed; running is preferred but the app will start it
+//   - .NET 8 SDK  (works on .NET 6/7 too - just change TargetFramework)
+//   - Project must target net8.0-windows and set <AllowUnsafeBlocks>false</...>
+//     plus <EnableComInterop> style dynamic binding (see .csproj)
+//
+// -----------------------------------------------------------------------------
+// BUILD & RUN
+// -----------------------------------------------------------------------------
+//   cd OutlookFileSearch
+//   dotnet restore
+//   dotnet run
+//
+//   Or build a standalone .exe:
+//   dotnet publish -c Release -r win-x64 --self-contained false
+// =============================================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+
+namespace OutlookFileSearch
+{
+    internal static class Program
+    {
+        private static void Main()
+        {
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
+
+            PrintHeader();
+
+            Console.WriteLine("1. Search Outlook mailbox (requires Outlook on this PC)");
+            Console.WriteLine("2. Search a local folder of documents");
+            Console.Write("\nChoose option (1 or 2): ");
+            var choice = (Console.ReadLine() ?? "1").Trim();
+
+            List<FoundFile> files;
+
+            if (choice == "2")
+            {
+                files = RunFolderMode();
+            }
+            else
+            {
+                files = RunOutlookMode();
+            }
+
+            if (files.Count == 0)
+            {
+                Console.WriteLine("\nNo supported files found. Exiting.");
+                return;
+            }
+
+            DisplayFilesFound(files);
+            RunSearchLoop(files);
+        }
+
+        // ---------------------------------------------------------------------
+        // MODE 1: Outlook
+        // ---------------------------------------------------------------------
+        private static List<FoundFile> RunOutlookMode()
+        {
+            Console.Write("\nFilter emails by subject keyword (press Enter for all): ");
+            var subjectFilter = (Console.ReadLine() ?? string.Empty).Trim();
+
+            Console.Write("Include subfolders of the Inbox? (y/N): ");
+            var recurse = (Console.ReadLine() ?? "n").Trim()
+                .StartsWith("y", StringComparison.OrdinalIgnoreCase);
+
+            using var scanner = new OutlookScanner();
+
+            if (!scanner.Connect())
+                return new List<FoundFile>();
+
+            return scanner.ScanForAttachments(
+                string.IsNullOrWhiteSpace(subjectFilter) ? null : subjectFilter,
+                recurse);
+        }
+
+        // ---------------------------------------------------------------------
+        // MODE 2: Plain folder (cross-platform-ish fallback, no Outlook needed)
+        // ---------------------------------------------------------------------
+        private static List<FoundFile> RunFolderMode()
+        {
+            Console.Write("\nEnter folder path: ");
+            var folder = (Console.ReadLine() ?? string.Empty).Trim().Trim('"', '\'');
+
+            if (!Directory.Exists(folder))
+            {
+                Console.WriteLine($"Folder not found: {folder}");
+                return new List<FoundFile>();
+            }
+
+            Console.WriteLine("\nScanning folder...");
+
+            var results = new List<FoundFile>();
+
+            foreach (var path in Directory.EnumerateFiles(folder, "*.*", SearchOption.AllDirectories))
+            {
+                var ext = Path.GetExtension(path).ToLowerInvariant();
+                if (!FileReader.SupportedExtensions.Contains(ext))
+                    continue;
+
+                results.Add(new FoundFile
+                {
+                    FileName  = Path.GetFileName(path),
+                    Extension = ext,
+                    Sender    = "(local file)",
+                    Subject   = Path.GetDirectoryName(path) ?? string.Empty,
+                    SizeBytes = new FileInfo(path).Length,
+                    LocalPath = path,      // already on disk - no extraction needed
+                    Received  = File.GetLastWriteTime(path)
+                });
+            }
+
+            Console.WriteLine($"Found {results.Count} supported files.");
+            return results;
+        }
+
+        // ---------------------------------------------------------------------
+        // Interactive search loop
+        // ---------------------------------------------------------------------
+        private static void RunSearchLoop(List<FoundFile> files)
+        {
+            Console.WriteLine();
+            Console.WriteLine(new string('=', 80));
+            Console.WriteLine("SEARCH MODE");
+            Console.WriteLine(new string('=', 80));
+
+            while (true)
+            {
+                Console.Write("\nWhat would you like to search for? (or 'quit'): ");
+                var query = (Console.ReadLine() ?? string.Empty).Trim();
+
+                if (query.Length == 0)
+                    continue;
+
+                if (query.Equals("quit", StringComparison.OrdinalIgnoreCase) ||
+                    query.Equals("exit", StringComparison.OrdinalIgnoreCase) ||
+                    query.Equals("q", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine("\nDone. Goodbye.");
+                    return;
+                }
+
+                if (query.Length < 2)
+                {
+                    Console.WriteLine("Please enter at least 2 characters.");
+                    continue;
+                }
+
+                var results = ContentSearcher.Search(files, query);
+                DisplayResults(query, files.Count, results);
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Console output helpers
+        // ---------------------------------------------------------------------
+        private static void PrintHeader()
+        {
+            Console.WriteLine(new string('=', 80));
+            Console.WriteLine("OUTLOOK FILE ATTACHMENT SEARCHER (C#)");
+            Console.WriteLine(new string('=', 80));
+            Console.WriteLine();
+        }
+
+        private static void DisplayFilesFound(List<FoundFile> files)
+        {
+            Console.WriteLine();
+            Console.WriteLine(new string('=', 80));
+            Console.WriteLine($"FOUND {files.Count} FILES");
+            Console.WriteLine(new string('=', 80));
+
+            foreach (var group in files.GroupBy(f => f.Extension).OrderBy(g => g.Key))
+            {
+                Console.WriteLine();
+                Console.WriteLine($"{group.Key.ToUpperInvariant()} FILES ({group.Count()}):");
+                Console.WriteLine(new string('-', 80));
+
+                var i = 1;
+                foreach (var f in group)
+                {
+                    Console.WriteLine($"  [{i++}] {f.FileName}  ({f.SizeBytes / 1024.0:F1} KB)");
+                    Console.WriteLine($"      From:    {f.Sender}");
+                    Console.WriteLine($"      Subject: {Truncate(f.Subject, 65)}");
+                }
+            }
+        }
+
+        private static void DisplayResults(string query, int totalSearched, List<SearchMatch> matches)
+        {
+            Console.WriteLine();
+            Console.WriteLine(new string('=', 80));
+            Console.WriteLine($"SEARCH RESULTS FOR: '{query}'");
+            Console.WriteLine(new string('=', 80));
+            Console.WriteLine($"Files searched: {totalSearched}");
+            Console.WriteLine($"Matches found:  {matches.Count}");
+
+            if (matches.Count == 0)
+            {
+                Console.WriteLine("\nNo matches found.");
+                return;
+            }
+
+            var n = 1;
+            foreach (var m in matches)
+            {
+                Console.WriteLine();
+                Console.WriteLine($"[{n++}] {m.File.FileName}");
+                Console.WriteLine($"    From:    {m.File.Sender}");
+                Console.WriteLine($"    Subject: {Truncate(m.File.Subject, 65)}");
+                Console.WriteLine($"    Matched lines ({m.TotalMatchCount} total, showing up to 5):");
+
+                foreach (var line in m.MatchedLines.Take(5))
+                    Console.WriteLine($"      - {Truncate(line, 100)}");
+            }
+        }
+
+        private static string Truncate(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            s = s.Replace("\r", " ").Replace("\n", " ").Trim();
+            return s.Length <= max ? s : s.Substring(0, max - 3) + "...";
+        }
+    }
+}
