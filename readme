@@ -1,0 +1,161 @@
+# Outlook File Attachment Searcher (C#)
+
+Console app that scans Outlook for `.txt`, `.csv`, `.docx`, `.xlsx`, and `.xls`
+attachments, asks what you want to find, and prints matching files and lines.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `Program.cs` | Entry point, menus, console output |
+| `OutlookScanner.cs` | Late-bound COM connection to Outlook, folder/attachment walk |
+| `ComHelper.cs` | P/Invoke replacement for `Marshal.GetActiveObject` (removed in .NET 5+) |
+| `FileReader.cs` | Converts each file type to searchable text |
+| `ContentSearcher.cs` | Models + keyword matching with content caching |
+| `OutlookFileSearch.csproj` | Target framework and NuGet packages |
+
+## Dependencies
+
+| Package | Why |
+|---|---|
+| `DocumentFormat.OpenXml` | `.docx` parsing |
+| `NPOI` | `.xlsx` and `.xls` parsing |
+| `System.Text.Encoding.CodePages` | NPOI needs this for legacy `.xls` encodings |
+| `Microsoft.CSharp` | `dynamic` keyword for late-bound COM |
+
+Outlook itself needs **no** package — no PIA, no `Microsoft.Office.Interop.Outlook`
+reference, no version pinning. The app talks to whatever Outlook is installed.
+
+## Requirements
+
+- Windows
+- Outlook desktop installed with a configured profile
+- .NET 8 SDK (or 6/7 — edit `TargetFramework` in the `.csproj`)
+
+## Build and run
+
+```bash
+cd OutlookFileSearch
+dotnet restore
+dotnet run
+```
+
+Standalone executable:
+
+```bash
+dotnet publish -c Release -r win-x64 --self-contained false
+# output: bin/Release/net8.0-windows/win-x64/publish/OutlookFileSearch.exe
+```
+
+If you're starting from scratch instead of using the provided `.csproj`:
+
+```bash
+dotnet new console -n OutlookFileSearch
+cd OutlookFileSearch
+dotnet add package DocumentFormat.OpenXml
+dotnet add package NPOI
+dotnet add package System.Text.Encoding.CodePages
+# then set TargetFramework to net8.0-windows in the .csproj
+```
+
+## Sample session
+
+```
+================================================================================
+OUTLOOK FILE ATTACHMENT SEARCHER (C#)
+================================================================================
+
+1. Search Outlook mailbox (requires Outlook on this PC)
+2. Search a local folder of documents
+
+Choose option (1 or 2): 1
+
+Filter emails by subject keyword (press Enter for all): budget
+Include subfolders of the Inbox? (y/N): y
+
+Connecting to Outlook...
+Connected to Outlook.
+
+Scanning Outlook for attachments...
+Scanned 412 messages.
+Extracted 23 supported attachments.
+
+================================================================================
+FOUND 23 FILES
+================================================================================
+
+.XLSX FILES (8):
+--------------------------------------------------------------------------------
+  [1] Q3_Budget_2024.xlsx  (245.3 KB)
+      From:    Finance Team
+      Subject: Q3 2024 Budget Planning
+
+================================================================================
+SEARCH MODE
+================================================================================
+
+What would you like to search for? (or 'quit'): revenue
+
+Searching 23 files for 'revenue'...
+
+================================================================================
+SEARCH RESULTS FOR: 'revenue'
+================================================================================
+Files searched: 23
+Matches found:  3
+
+[1] Q3_Budget_2024.xlsx
+    From:    Finance Team
+    Subject: Q3 2024 Budget Planning
+    Matched lines (6 total, showing up to 5):
+      - Revenue projections | 850000 | 920000 | 1000000
+      - Revenue growth rate | 8% | YoY
+```
+
+## Design notes worth knowing
+
+**Late binding over typed interop.** `Microsoft.Office.Interop.Outlook` pins you
+to one Outlook version and is awkward on .NET 8. `Type.GetTypeFromProgID` plus
+`dynamic` works against any installed version with zero references.
+
+**Elevation must match.** COM won't connect across integrity levels. If Outlook
+runs as a normal user and you run this from an elevated terminal, `Connect()`
+fails. Run both the same way.
+
+**Attachments are extracted to a temp folder** under `%TEMP%`, then deleted in
+`Dispose()`. Names are prefixed with an index so two files called `report.xlsx`
+don't overwrite each other.
+
+**Content is cached after the first read.** Searching a second keyword doesn't
+re-parse every workbook — `FoundFile.CachedContent` holds the text for the
+session. On a large mailbox this is the difference between one slow pass and
+several.
+
+**Subject filtering happens server-side** via `Items.Restrict("[Subject] like
+'%keyword%'")` rather than looping in C#. Much faster on large mailboxes.
+
+**COM objects are explicitly released** with `Marshal.ReleaseComObject` in
+`finally` blocks. Skipping this leaves orphaned `OUTLOOK.EXE` processes running
+after the app exits.
+
+## Extending it
+
+- **Search other folders**: change `GetDefaultFolder(6)` in `OutlookScanner.cs`.
+  `5` = Sent Items, `3` = Deleted Items, `4` = Outbox.
+- **Add PDF support**: add `PdfPig` or `iText7`, add `.pdf` to
+  `FileReader.SupportedExtensions`, and add a case to the switch.
+- **Regex instead of substring**: swap the `IndexOf` calls in `ContentSearcher`
+  for `Regex.IsMatch`.
+- **Export results**: serialize the `List<SearchMatch>` with
+  `System.Text.Json.JsonSerializer`.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Failed to connect to Outlook` | Outlook not installed, no profile configured, or elevation mismatch between the app and Outlook |
+| A second Outlook window opens | Outlook wasn't running; the app started it. Open Outlook first to attach instead |
+| `No data is available for encoding 1252` | `System.Text.Encoding.CodePages` missing, or `RegisterProvider` not called |
+| Some attachments silently skipped | Inline images and blocked types fail `SaveAsFile`; that's caught and skipped by design |
+| Scan is slow | Use the subject filter, and leave "include subfolders" off |
+| `OUTLOOK.EXE` lingers after exit | Something threw before `Dispose()` ran — check that `using var scanner` is intact |
